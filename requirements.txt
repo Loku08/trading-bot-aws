@@ -1,0 +1,6 @@
+pandas
+numpy==1.26.4
+python-binance
+pandas-ta
+python-telegram-bot
+python-dotenv 
