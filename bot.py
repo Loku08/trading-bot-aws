@@ -2,6 +2,7 @@ import os
 import time
 import logging
 import pandas as pd
+import numpy as np
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from datetime import datetime, timedelta
@@ -22,7 +23,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger("binance_scalping_bot")
+logger = logging.getLogger("binance_bot")
 
 # Załadowanie zmiennych środowiskowych
 load_dotenv()
@@ -35,46 +36,43 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
 STATE_FILE = "state.json"
 
-class BinanceScalpingBot:
+class BinanceTradingBot:
     def __init__(self):
         self.client = Client(API_KEY, API_SECRET)
+        
+        # Przełącz na Testnet, jeśli jest włączony w konfiguracji
+        if USE_TESTNET:
+            self.client.API_URL = 'https://testnet.binance.vision/api'
+            logger.info("Łączenie z Binance Spot Testnet...")
+        
         self.telegram_bot = None
         if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
             self.telegram_bot = telegram.Bot(token=TELEGRAM_TOKEN)
         
-        # Domyślny stan bota
-        self.active = True
+        # Inicjalizacja stanu z wartościami domyślnymi
         self.in_position = False
         self.position_side = None
         self.entry_price = 0
-        self.position_size = 0
+        self.position_size_usdc = 0 # Przechowujemy wartość pozycji w USDC
         self.stop_loss = 0
-        self.take_profit = 0
-        self.daily_pl = 0
-        self.daily_trades = 0
-        self.successful_trades = 0
-        self.failed_trades = 0
-        self.last_day_reset = datetime.now().date().isoformat()
+        self.last_summary_date = datetime.now().date().isoformat()
         
         self._load_state()
         
         logger.info(f"Bot zainicjalizowany dla {SYMBOL} na interwale {INTERVAL}")
-        self._send_telegram_message("🤖 Bot został uruchomiony!")
+        if not self.in_position:
+             self._send_telegram_message("🤖 Bot został uruchomiony i szuka okazji do wejścia.")
+        else:
+             self._send_telegram_message(f"🤖 Bot został zrestartowany i kontynuuje zarządzanie pozycją {self.position_side} otwartą po cenie {self.entry_price:.4f}.")
 
     def _save_state(self):
-        """Zapisuje stan bota do pliku JSON."""
         state = {
             "in_position": self.in_position,
             "position_side": self.position_side,
             "entry_price": self.entry_price,
-            "position_size": self.position_size,
+            "position_size_usdc": self.position_size_usdc,
             "stop_loss": self.stop_loss,
-            "take_profit": self.take_profit,
-            "daily_pl": self.daily_pl,
-            "daily_trades": self.daily_trades,
-            "successful_trades": self.successful_trades,
-            "failed_trades": self.failed_trades,
-            "last_day_reset": self.last_day_reset,
+            "last_summary_date": self.last_summary_date
         }
         try:
             with open(STATE_FILE, 'w') as f:
@@ -84,7 +82,6 @@ class BinanceScalpingBot:
             logger.error(f"Błąd zapisu stanu: {e}")
 
     def _load_state(self):
-        """Wczytuje stan bota z pliku JSON."""
         if not os.path.exists(STATE_FILE):
             logger.info("Plik stanu nie istnieje. Uruchamiam z domyślnym stanem.")
             return
@@ -94,293 +91,312 @@ class BinanceScalpingBot:
             self.in_position = state.get("in_position", False)
             self.position_side = state.get("position_side")
             self.entry_price = state.get("entry_price", 0)
-            self.position_size = state.get("position_size", 0)
+            self.position_size_usdc = state.get("position_size_usdc", 0)
             self.stop_loss = state.get("stop_loss", 0)
-            self.take_profit = state.get("take_profit", 0)
-            self.daily_pl = state.get("daily_pl", 0)
-            self.daily_trades = state.get("daily_trades", 0)
-            self.successful_trades = state.get("successful_trades", 0)
-            self.failed_trades = state.get("failed_trades", 0)
-            self.last_day_reset = state.get("last_day_reset", datetime.now().date().isoformat())
+            self.last_summary_date = state.get("last_summary_date", datetime.now().date().isoformat())
             logger.info("Stan bota został wczytany.")
         except (IOError, json.JSONDecodeError) as e:
             logger.error(f"Błąd wczytywania stanu: {e}. Używam stanu domyślnego.")
 
     def _send_telegram_message(self, message):
-        """Wysyła powiadomienie przez Telegram"""
         if self.telegram_bot and TELEGRAM_CHAT_ID:
             try:
                 self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
             except Exception as e:
                 logger.error(f"Błąd wysyłania wiadomości Telegram: {e}")
-    
-    def _get_account_balance(self):
-        """Pobiera stan konta USDC"""
+
+    def _get_account_balance(self, quote_asset='USDC'):
         try:
             account = self.client.get_account()
             for balance in account['balances']:
-                if balance['asset'] == 'USDC':
+                if balance['asset'] == quote_asset:
                     return float(balance['free'])
+            logger.warning(f"Nie znaleziono salda dla {quote_asset}. Zwracam 0.")
             return 0
         except BinanceAPIException as e:
             logger.error(f"Błąd pobierania stanu konta: {e}")
             return 0
-    
-    def _fetch_data(self, limit=100):
-        """Pobiera dane historyczne"""
+
+    def _fetch_data(self, limit=200):
         try:
             klines = self.client.get_klines(symbol=SYMBOL, interval=INTERVAL, limit=limit)
-            df = pd.DataFrame(klines, columns=[
-                'timestamp', 'open', 'high', 'low', 'close', 'volume',
-                'close_time', 'quote_asset_volume', 'number_of_trades',
-                'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
-            ])
+            df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 df[col] = pd.to_numeric(df[col])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            return df
+
+            df_daily = None
+            if USE_MARKET_REGIME_FILTER:
+                start_date_str = (datetime.utcnow() - timedelta(days=REGIME_FILTER_PERIOD * 2)).strftime("%d %b, %Y")
+                daily_klines = self.client.get_historical_klines(SYMBOL, Client.KLINE_INTERVAL_1DAY, start_date_str)
+                df_daily = pd.DataFrame(daily_klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    df_daily[col] = pd.to_numeric(df_daily[col])
+                df_daily['timestamp'] = pd.to_datetime(df_daily['timestamp'], unit='ms').dt.date
+                df_daily.set_index('timestamp', inplace=True)
+            
+            return df, df_daily
         except BinanceAPIException as e:
-            logger.error(f"Błąd pobierania danych: {e}")
-            return None
-    
-    def _calculate_indicators(self, df):
-        """Oblicza wskaźniki techniczne"""
+            logger.error(f"Błąd pobierania danych z Binance: {e}")
+            return None, None
+            
+    def _calculate_indicators(self, df, df_daily=None):
         try:
+            df.set_index('timestamp', inplace=True)
             df['ema_short'] = ta.ema(df['close'], length=EMA_SHORT)
             df['ema_long'] = ta.ema(df['close'], length=EMA_LONG)
             df['rsi'] = ta.rsi(df['close'], length=RSI_PERIOD)
             df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=ATR_PERIOD)
-            df['vol_ma'] = df['volume'].rolling(window=VOLUME_PERIOD).mean()
+            
+            if USE_DYNAMIC_RISK:
+                adx_df = ta.adx(df['high'], df['low'], df['close'], length=ADX_PERIOD_FOR_RISK)
+                if adx_df is not None and not adx_df.empty:
+                    df['adx'] = adx_df[f'ADX_{ADX_PERIOD_FOR_RISK}']
+
+            if USE_MARKET_REGIME_FILTER and df_daily is not None and not df_daily.empty:
+                df_daily['regime_sma'] = ta.sma(df_daily['close'], length=REGIME_FILTER_PERIOD)
+                
+                df['daily_close'] = df.index.to_series().dt.date.map(df_daily['close'])
+                df['daily_regime_sma'] = df.index.to_series().dt.date.map(df_daily['regime_sma'])
+            
+            df.reset_index(inplace=True)
+            df.dropna(inplace=True)
             return df
         except Exception as e:
             logger.error(f"Błąd obliczania wskaźników: {e}")
-            return df
-    
-    def _check_buy_signal(self, df):
-        """Sprawdza sygnał kupna"""
-        last = df.iloc[-1]
-        return last['ema_short'] > last['ema_long'] and last['rsi'] < RSI_OVERSOLD and last['volume'] > last['vol_ma']
+            return None
 
-    def _check_sell_signal(self, df):
-        """Sprawdza sygnał sprzedaży"""
+    def _check_buy_signal(self, df):
+        if len(df) < 2: return False
         last = df.iloc[-1]
         previous = df.iloc[-2]
-        return last['ema_short'] < last['ema_long'] and last['rsi'] > RSI_OVERBOUGHT and last['volume'] < previous['volume']
-
-    def _calculate_position_size(self, entry_price, stop_loss_price):
-        """Oblicza wielkość pozycji na podstawie ryzyka"""
-        balance = self._get_account_balance()
-        if balance == 0: return 0
         
-        risk_amount = balance * RISK_PER_TRADE
+        if USE_MARKET_REGIME_FILTER:
+            if 'daily_regime_sma' not in last or pd.isna(last['daily_regime_sma']) or last['daily_close'] < last['daily_regime_sma']:
+                return False
+
+        trend_ok = last['ema_short'] > last['ema_long']
+        rsi_signal = previous['rsi'] < RSI_BUY_LEVEL and last['rsi'] >= RSI_BUY_LEVEL
+        
+        return trend_ok and rsi_signal
+
+    def _check_sell_signal(self, df):
+        if len(df) < 2: return False
+        last = df.iloc[-1]
+        previous = df.iloc[-2]
+
+        if USE_MARKET_REGIME_FILTER:
+            if 'daily_regime_sma' not in last or pd.isna(last['daily_regime_sma']) or last['daily_close'] > last['daily_regime_sma']:
+                return False
+
+        trend_ok = last['ema_short'] < last['ema_long']
+        rsi_signal = previous['rsi'] > RSI_SELL_LEVEL and last['rsi'] <= RSI_SELL_LEVEL
+        
+        return trend_ok and rsi_signal
+
+    def _calculate_position_size_usdc(self, balance, entry_price, stop_loss_price, adx_value):
+        if entry_price == stop_loss_price: return 0
+        
+        risk_per_trade = RISK_PER_TRADE_LOW
+        if USE_DYNAMIC_RISK:
+            risk_per_trade = RISK_PER_TRADE_HIGH if adx_value > RISK_ADX_THRESHOLD else RISK_PER_TRADE_LOW
+            logger.info(f"Dynamiczne ryzyko aktywne. ADX={adx_value:.2f}, Ryzyko={risk_per_trade*100:.1f}%")
+
+        risk_amount = balance * risk_per_trade
         sl_distance_percent = abs(entry_price - stop_loss_price) / entry_price
         
-        if sl_distance_percent == 0: return 0
-        
-        position_value = risk_amount / sl_distance_percent
-        
-        if self.daily_pl < -balance * MAX_DAILY_RISK:
-            logger.warning("Osiągnięto dzienny limit strat. Handel wstrzymany na dziś.")
-            return 0
-        
-        # Pobranie informacji o symbolu, aby uzyskać precyzję ilości
-        info = self.client.get_symbol_info(SYMBOL)
-        step_size = float([f['stepSize'] for f in info['filters'] if f['filterType'] == 'LOT_SIZE'][0])
-        
-        quantity = position_value / entry_price
-        
-        # Zaokrąglenie do właściwej precyzji
-        precision = int(round(-np.log10(step_size)))
-        return round(quantity, precision)
+        position_size_usdc = risk_amount / sl_distance_percent
+        return position_size_usdc
 
-    def _calculate_stop_loss(self, side, entry_price, atr):
-        if side == 'BUY':
-            return entry_price - (SL_ATR_MULTIPLIER * atr)
-        return entry_price + (SL_ATR_MULTIPLIER * atr)
-
-    def _calculate_take_profit(self, side, entry_price, stop_loss):
-        if side == 'BUY':
-            return entry_price + (abs(entry_price - stop_loss) * TP_SL_RATIO)
-        return entry_price - (abs(entry_price - stop_loss) * TP_SL_RATIO)
-
-    def _execute_order(self, side, quantity):
-        """Wykonuje zlecenie MARKET i zwraca cenę wykonania."""
+    def _execute_market_order(self, side, quantity_usdc):
         try:
+            # Binance API dla zleceń MARKET wymaga `quoteOrderQty` dla ilości w USDC
             order = self.client.create_order(
                 symbol=SYMBOL,
                 side=side,
                 type='MARKET',
-                quantity=quantity
+                quoteOrderQty=round(quantity_usdc, 2) # Zaokrąglij do 2 miejsc po przecinku dla USDC
             )
             logger.info(f"Zlecenie wykonane: {order}")
-            self._send_telegram_message(f"🔄 Zlecenie: {side} {quantity} {SYMBOL}")
             
-            # Oblicz średnią cenę wykonania
-            total_price = sum(float(f['price']) * float(f['qty']) for f in order['fills'])
-            total_qty = sum(float(f['qty']) for f in order['fills'])
-            avg_price = total_price / total_qty if total_qty > 0 else 0
+            # Pobierz rzeczywistą cenę wejścia i ilość z odpowiedzi
+            entry_price = float(order['fills'][0]['price']) if order['fills'] else float(order['price'])
+            executed_qty = float(order['executedQty'])
             
-            return avg_price
+            return entry_price, executed_qty
+
         except BinanceAPIException as e:
-            logger.error(f"Błąd wykonania zlecenia: {e}")
-            self._send_telegram_message(f"⚠️ Błąd zlecenia: {e}")
-            return None
+            logger.error(f"Błąd wykonania zlecenia na Binance: {e}")
+            self._send_telegram_message(f"⚠️ KRYTYCZNY BŁĄD ZLECENIA: {e}")
+            return None, None
+            
+    def _open_position(self, side, df):
+        last_row = df.iloc[-1]
+        current_price = last_row['close']
+        atr = last_row['atr']
+        adx = last_row.get('adx', 0)
 
-    def _check_exit_conditions(self, current_price):
-        """Sprawdza warunki wyjścia z pozycji"""
-        if not self.in_position: return False
-        
-        if self.position_side == 'BUY':
-            if current_price <= self.stop_loss: return 'stop_loss'
-            if current_price >= self.take_profit: return 'take_profit'
-        elif self.position_side == 'SELL':
-            if current_price >= self.stop_loss: return 'stop_loss'
-            if current_price <= self.take_profit: return 'take_profit'
-        return False
+        balance = self._get_account_balance()
+        if balance <= 10: # Minimalna kwota do handlu
+            logger.warning(f"Niewystarczające środki na koncie ({balance:.2f} USDC). Handel wstrzymany.")
+            return
 
-    def _process_exit(self, exit_price, exit_type):
-        """Przetwarza wyjście z pozycji"""
-        if self.position_side == 'BUY':
-            pl_percent = (exit_price - self.entry_price) / self.entry_price
-        else:
-            pl_percent = (self.entry_price - exit_price) / self.entry_price
+        # Ustaw SL na podstawie ATR
+        sl_price = current_price - atr * TRAILING_SL_ATR_MULTIPLIER if side == 'BUY' else current_price + atr * TRAILING_SL_ATR_MULTIPLIER
         
-        pl_amount = self.position_size * self.entry_price * pl_percent
-        self.daily_pl += pl_amount
-        self.daily_trades += 1
+        # Oblicz wielkość pozycji
+        position_size_usdc = self._calculate_position_size_usdc(balance, current_price, sl_price, adx)
+        if position_size_usdc < 10: # Minimalna wartość zlecenia na Binance
+            logger.warning(f"Obliczona wielkość pozycji ({position_size_usdc:.2f} USDC) jest poniżej minimum. Nie otwieram pozycji.")
+            return
+        
+        # Wykonaj zlecenie
+        entry_price, executed_qty = self._execute_market_order(side, position_size_usdc)
+        
+        if entry_price is not None and executed_qty > 0:
+            self.in_position = True
+            self.position_side = side
+            self.entry_price = entry_price
+            self.position_size_usdc = executed_qty * entry_price
+            self.stop_loss = sl_price
 
-        if pl_percent > 0:
-            self.successful_trades += 1
-            message = f"✅ Zamknięto pozycję ({exit_type}): {pl_percent:.2%} zysku ({pl_amount:.2f} USDC)"
-        else:
-            self.failed_trades += 1
-            message = f"❌ Zamknięto pozycję ({exit_type}): {pl_percent:.2%} straty ({pl_amount:.2f} USDC)"
+            self._save_state()
+            msg = f"✅ OTWARTA POZYCJA {side} | Cena: {self.entry_price:.4f} | Wielkość: {self.position_size_usdc:.2f} USDC | Stop Loss: {self.stop_loss:.4f}"
+            logger.info(msg)
+            self._send_telegram_message(msg)
+
+    def _close_position(self, exit_price):
+        side = 'SELL' if self.position_side == 'BUY' else 'BUY'
         
-        logger.info(message)
-        self._send_telegram_message(message)
+        # Pobierz aktualną ilość BASE asset (np. BTC) do zamknięcia
+        base_asset = SYMBOL.replace('USDC', '')
+        try:
+            qty_to_close = float(self.client.get_asset_balance(asset=base_asset)['free'])
+        except BinanceAPIException as e:
+            logger.error(f"Nie udało się pobrać salda {base_asset} do zamknięcia pozycji: {e}")
+            self._send_telegram_message(f"⚠️ BŁĄD KRYTYCZNY: Nie mogę pobrać salda {base_asset} do zamknięcia pozycji!")
+            return # Nie resetuj stanu, jeśli nie wiemy, czy pozycja jest zamknięta
+
+        # Wykonaj zlecenie zamknięcia
+        self.client.create_order(symbol=SYMBOL, side=side, type='MARKET', quantity=qty_to_close)
+
+        pnl = (exit_price - self.entry_price) if self.position_side == 'BUY' else (self.entry_price - exit_price)
+        pnl_percent = (pnl / self.entry_price) * 100
+        pnl_usdc = self.position_size_usdc * (pnl_percent / 100)
         
-        # Reset stanu pozycji
+        msg = f"❌ ZAMKNIĘTA POZYCJA {self.position_side} | Cena wyjścia: {exit_price:.4f} | Zysk/Strata: {pnl_usdc:.2f} USDC ({pnl_percent:.2f}%)"
+        logger.info(msg)
+        self._send_telegram_message(msg)
+        
+        # Resetuj stan
         self.in_position = False
         self.position_side = None
         self.entry_price = 0
-        self.position_size = 0
+        self.position_size_usdc = 0
         self.stop_loss = 0
-        self.take_profit = 0
         self._save_state()
 
-    def _open_position(self, side, current_price, atr):
-        """Otwiera nową pozycję."""
-        stop_loss_price = self._calculate_stop_loss(side, current_price, atr)
-        position_size = self._calculate_position_size(current_price, stop_loss_price)
-
-        if position_size <= 0:
-            logger.info("Wielkość pozycji wynosi 0, zlecenie nie zostało złożone.")
-            return
-
-        # Wykonaj zlecenie
-        executed_price = self._execute_order(side, position_size)
-        if not executed_price:
-            logger.error("Nie udało się otworzyć pozycji.")
-            return
-
-        # Aktualizuj SL i TP o rzeczywistą cenę wejścia
-        self.entry_price = executed_price
-        self.stop_loss = self._calculate_stop_loss(side, executed_price, atr)
-        self.take_profit = self._calculate_take_profit(side, executed_price, self.stop_loss)
-        self.position_side = side
-        self.position_size = position_size
-        self.in_position = True
+    def _monitor_and_manage_position(self):
+        logger.info(f"Rozpoczynam monitorowanie otwartej pozycji {self.position_side}...")
         
-        logger.info(f"Otwarto pozycję {side}: cena={self.entry_price:.2f}, SL={self.stop_loss:.2f}, TP={self.take_profit:.2f}")
-        self._send_telegram_message(
-            f"🟢 Pozycja {side}:\n"
-            f"Wejście: {self.entry_price:.2f}\n"
-            f"Stop Loss: {self.stop_loss:.2f}\n"
-            f"Take Profit: {self.take_profit:.2f}"
-        )
-        self._save_state()
-
-    def _reset_daily_stats(self):
-        """Resetuje dzienne statystyki o północy."""
-        current_date = datetime.now().date()
-        last_reset_date = datetime.fromisoformat(self.last_day_reset).date()
-
-        if current_date > last_reset_date:
-            win_rate = (self.successful_trades / self.daily_trades * 100) if self.daily_trades > 0 else 0
-            summary = (
-                f"📊 Podsumowanie dnia {last_reset_date.isoformat()}:\n"
-                f"Transakcje: {self.daily_trades}, Udane: {self.successful_trades} ({win_rate:.2f}%)\n"
-                f"Zysk/strata: {self.daily_pl:.2f} USDC"
-            )
-            logger.info(summary)
-            self._send_telegram_message(summary)
-            
-            self.daily_pl = 0
-            self.daily_trades = 0
-            self.successful_trades = 0
-            self.failed_trades = 0
-            self.last_day_reset = current_date.isoformat()
-            self._save_state()
-
-    def run(self):
-        """Główna pętla bota."""
-        logger.info("Bot rozpoczyna działanie...")
-        
-        while self.active:
+        while self.in_position:
             try:
-                self._reset_daily_stats()
-                
-                # Czekaj na początek następnej minuty
-                now = datetime.now()
-                next_minute = (now + timedelta(minutes=1)).replace(second=5, microsecond=0)
-                sleep_duration = (next_minute - now).total_seconds()
-                
-                if sleep_duration > 0:
-                    logger.info(f"Czekam {sleep_duration:.2f}s do następnej świecy...")
-                    time.sleep(sleep_duration)
-
-                df = self._fetch_data(limit=100)
+                # Pobierz najnowszą cenę i wskaźniki
+                df, _ = self._fetch_data(limit=100) # Pobierz mniej danych, tylko do TSL
                 if df is None or df.empty:
+                    time.sleep(60)
                     continue
+
+                df_with_indicators = self._calculate_indicators(df)
+                if df_with_indicators is None or df_with_indicators.empty:
+                    time.sleep(60)
+                    continue
+                    
+                last_row = df_with_indicators.iloc[-1]
+                current_price = last_row['close']
+                current_atr = last_row['atr']
                 
-                df = self._calculate_indicators(df)
-                if df.empty or 'atr' not in df.columns:
-                    logger.warning("Nie udało się obliczyć wskaźników.")
-                    continue
+                # Sprawdź warunek Stop Loss
+                if (self.position_side == 'BUY' and current_price <= self.stop_loss) or \
+                   (self.position_side == 'SELL' and current_price >= self.stop_loss):
+                    logger.info(f"Warunek Stop Loss ({self.stop_loss:.4f}) został spełniony przy cenie {current_price:.4f}.")
+                    self._close_position(self.stop_loss)
+                    break # Wyjdź z pętli monitorowania
 
-                current_price = df['close'].iloc[-1]
-                atr = df['atr'].iloc[-1]
+                # Zaktualizuj Trailing Stop Loss
+                if USE_TRAILING_STOP:
+                    new_sl = 0
+                    if self.position_side == 'BUY':
+                        new_sl = max(self.stop_loss, current_price - current_atr * TRAILING_SL_ATR_MULTIPLIER)
+                    else: # SELL
+                        new_sl = min(self.stop_loss, current_price + current_atr * TRAILING_SL_ATR_MULTIPLIER)
+                    
+                    if new_sl != self.stop_loss:
+                        self.stop_loss = new_sl
+                        self._save_state()
+                        logger.info(f"Trailing Stop Loss zaktualizowany do: {self.stop_loss:.4f}")
 
-                if self.in_position:
-                    exit_type = self._check_exit_conditions(current_price)
-                    if exit_type:
-                        exit_side = 'SELL' if self.position_side == 'BUY' else 'BUY'
-                        exit_price = self._execute_order(exit_side, self.position_size)
-                        if exit_price:
-                            self._process_exit(exit_price, exit_type)
-                        else:
-                            logger.error("Błąd zlecenia wyjścia, pozycja może być wciąż otwarta!")
-                else: # Nie jesteśmy w pozycji
-                    if self._check_buy_signal(df):
-                        self._open_position('BUY', current_price, atr)
-                    elif self._check_sell_signal(df):
-                        self._open_position('SELL', current_price, atr)
+                time.sleep(60) # Sprawdzaj co 60 sekund
 
             except Exception as e:
-                logger.critical(f"Krytyczny błąd w pętli głównej: {e}", exc_info=True)
-                self._send_telegram_message(f"🚨 Krytyczny błąd bota: {e}")
+                logger.error(f"Wystąpił błąd w pętli monitorującej: {e}")
+                self._send_telegram_message(f"⚠️ Błąd w pętli monitorującej: {e}")
+                time.sleep(60)
+
+    def _send_daily_summary(self):
+        today_str = datetime.now().date().isoformat()
+        if today_str > self.last_summary_date:
+            logger.info("Nowy dzień, wysyłanie podsumowania...")
+            try:
+                balance = self._get_account_balance()
+                msg = f"☀️ Podsumowanie dzienne: Aktualne saldo konta USDC wynosi: {balance:.2f} USDC."
+                self._send_telegram_message(msg)
+                
+                self.last_summary_date = today_str
+                self._save_state()
+            except Exception as e:
+                logger.error(f"Nie udało się wysłać dziennego podsumowania: {e}")
+
+    def run(self):
+        while True:
+            try:
+                self._send_daily_summary() # Sprawdź, czy wysłać podsumowanie
+
+                if self.in_position:
+                    self._monitor_and_manage_position()
+                else:
+                    # Logika szukania wejścia
+                    now = datetime.utcnow()
+                    minutes = now.minute
+                    
+                    # Czekaj na zamknięcie świecy 15-minutowej
+                    if minutes % 15 == 0:
+                        logger.info("Sprawdzanie sygnałów na nowej świecy...")
+                        df, df_daily = self._fetch_data()
+                        if df is not None:
+                            df_with_indicators = self._calculate_indicators(df, df_daily)
+                            if df_with_indicators is not None and not df_with_indicators.empty:
+                                if self._check_buy_signal(df_with_indicators):
+                                    logger.info("Wykryto sygnał KUPNA.")
+                                    self._open_position('BUY', df_with_indicators)
+                                elif self._check_sell_signal(df_with_indicators):
+                                    logger.info("Wykryto sygnał SPRZEDAŻY.")
+                                    self._open_position('SELL', df_with_indicators)
+                    
+                    # Uśpij bota do następnej świecy
+                    time_to_sleep = (15 - (minutes % 15)) * 60 - now.second
+                    logger.info(f"Brak pozycji. Czekam {time_to_sleep:.0f} sekund do następnej świecy.")
+                    time.sleep(max(1, time_to_sleep))
+            
+            except KeyboardInterrupt:
+                logger.info("Zatrzymywanie bota...")
+                self._save_state()
+                break
+            except Exception as e:
+                logger.critical(f"KRYTYCZNY BŁĄD w głównej pętli: {e}", exc_info=True)
+                self._send_telegram_message(f"🚨 KRYTYCZNY BŁĄD BOTA: {e}")
                 time.sleep(60)
 
 if __name__ == "__main__":
-    bot = BinanceScalpingBot()
-    try:
-        bot.run()
-    except KeyboardInterrupt:
-        logger.info("Bot zatrzymywany przez użytkownika...")
-        bot.active = False
-        bot._save_state()
-        bot._send_telegram_message("🛑 Bot został zatrzymany.")
-    except Exception as e:
-        logger.critical(f"Krytyczny błąd poza pętlą główną: {e}", exc_info=True)
-        bot._send_telegram_message(f"🚨 Krytyczny błąd bota: {e}")
-        bot._save_state()
+    bot = BinanceTradingBot()
+    bot.run()
