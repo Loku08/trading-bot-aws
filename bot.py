@@ -171,12 +171,25 @@ class BinanceTradingBot:
         last = df.iloc[-1]
         previous = df.iloc[-2]
         
+        # Debug logging
+        logger.info(f"Sprawdzanie sygnału BUY:")
+        logger.info(f"  EMA30: {last['ema_short']:.4f}, EMA60: {last['ema_long']:.4f}")
+        logger.info(f"  RSI poprzedni: {previous['rsi']:.2f}, RSI aktualny: {last['rsi']:.2f}")
+        
         if USE_MARKET_REGIME_FILTER:
             if 'daily_regime_sma' not in last or pd.isna(last['daily_regime_sma']) or last['daily_close'] < last['daily_regime_sma']:
+                logger.info(f"  Market regime filter: FAIL (daily_close: {last.get('daily_close', 'N/A'):.4f}, regime_sma: {last.get('daily_regime_sma', 'N/A'):.4f})")
                 return False
+            else:
+                logger.info(f"  Market regime filter: PASS (daily_close: {last['daily_close']:.4f} >= regime_sma: {last['daily_regime_sma']:.4f})")
 
         trend_ok = last['ema_short'] > last['ema_long']
-        rsi_signal = previous['rsi'] < RSI_BUY_LEVEL and last['rsi'] >= RSI_BUY_LEVEL
+        rsi_level = RSI_BUY_LEVEL_ALT if USE_ALTERNATIVE_RSI else RSI_BUY_LEVEL
+        rsi_signal = previous['rsi'] < rsi_level and last['rsi'] >= rsi_level
+        
+        logger.info(f"  Trend OK: {trend_ok}")
+        logger.info(f"  RSI signal: {rsi_signal} (using level: {rsi_level})")
+        logger.info(f"  Final BUY signal: {trend_ok and rsi_signal}")
         
         return trend_ok and rsi_signal
 
@@ -185,12 +198,25 @@ class BinanceTradingBot:
         last = df.iloc[-1]
         previous = df.iloc[-2]
 
+        # Debug logging
+        logger.info(f"Sprawdzanie sygnału SELL:")
+        logger.info(f"  EMA30: {last['ema_short']:.4f}, EMA60: {last['ema_long']:.4f}")
+        logger.info(f"  RSI poprzedni: {previous['rsi']:.2f}, RSI aktualny: {last['rsi']:.2f}")
+
         if USE_MARKET_REGIME_FILTER:
             if 'daily_regime_sma' not in last or pd.isna(last['daily_regime_sma']) or last['daily_close'] > last['daily_regime_sma']:
+                logger.info(f"  Market regime filter: FAIL (daily_close: {last.get('daily_close', 'N/A'):.4f}, regime_sma: {last.get('daily_regime_sma', 'N/A'):.4f})")
                 return False
+            else:
+                logger.info(f"  Market regime filter: PASS (daily_close: {last['daily_close']:.4f} <= regime_sma: {last['daily_regime_sma']:.4f})")
 
         trend_ok = last['ema_short'] < last['ema_long']
-        rsi_signal = previous['rsi'] > RSI_SELL_LEVEL and last['rsi'] <= RSI_SELL_LEVEL
+        rsi_level = RSI_SELL_LEVEL_ALT if USE_ALTERNATIVE_RSI else RSI_SELL_LEVEL
+        rsi_signal = previous['rsi'] > rsi_level and last['rsi'] <= rsi_level
+        
+        logger.info(f"  Trend OK: {trend_ok}")
+        logger.info(f"  RSI signal: {rsi_signal} (using level: {rsi_level})")
+        logger.info(f"  Final SELL signal: {trend_ok and rsi_signal}")
         
         return trend_ok and rsi_signal
 
@@ -368,10 +394,12 @@ class BinanceTradingBot:
                     # Logika szukania wejścia
                     now = datetime.utcnow()
                     minutes = now.minute
+                    seconds = now.second
                     
-                    # Czekaj na zamknięcie świecy 15-minutowej
-                    if minutes % 15 == 0:
-                        logger.info("Sprawdzanie sygnałów na nowej świecy...")
+                    # Sprawdzaj sygnały w pierwszych 2 minutach po zamknięciu świecy 15-minutowej
+                    # To daje większe okno na sprawdzenie sygnałów w przypadku problemów z API
+                    if minutes % 15 <= 1:  # 0 lub 1 minuta po zamknięciu świecy
+                        logger.info(f"Sprawdzanie sygnałów na nowej świecy (minuta {minutes})...")
                         df, df_daily = self._fetch_data()
                         if df is not None:
                             df_with_indicators = self._calculate_indicators(df, df_daily)
@@ -382,11 +410,14 @@ class BinanceTradingBot:
                                 elif self._check_sell_signal(df_with_indicators):
                                     logger.info("Wykryto sygnał SPRZEDAŻY.")
                                     self._open_position('SELL', df_with_indicators)
-                    
-                    # Uśpij bota do następnej świecy
-                    time_to_sleep = (15 - (minutes % 15)) * 60 - now.second
-                    logger.info(f"Brak pozycji. Czekam {time_to_sleep:.0f} sekund do następnej świecy.")
-                    time.sleep(max(1, time_to_sleep))
+                        
+                        # Po sprawdzeniu sygnałów, czekaj do następnego okna
+                        time.sleep(60)  # Czekaj minutę przed następnym sprawdzeniem
+                    else:
+                        # Uśpij bota do następnej świecy
+                        time_to_sleep = (15 - (minutes % 15)) * 60 - seconds
+                        logger.info(f"Brak pozycji. Czekam {time_to_sleep:.0f} sekund do następnej świecy.")
+                        time.sleep(max(60, time_to_sleep))  # Minimum 60 sekund
             
             except KeyboardInterrupt:
                 logger.info("Zatrzymywanie bota...")
